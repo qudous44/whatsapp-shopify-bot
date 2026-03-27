@@ -1,0 +1,23 @@
+{
+  "name": "whatsapp-shopify-automation",
+  "version": "1.0.0",
+  "description": "Free WhatFlow alternative - Baileys + Shopify Webhooks",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "nodemon server.js",
+    "setup-webhooks": "node setup-webhooks.js"
+  },
+  "dependencies": {
+    "@whiskeysockets/baileys": "^6.7.9",
+    "express": "^4.18.2",
+    "qrcode": "^1.5.3",
+    "axios": "^1.6.0",
+    "dotenv": "^16.3.1",
+    "pino": "^8.15.0",
+    "pino-pretty": "^10.2.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.1"
+  }
+}

@@ -1,0 +1,31 @@
+I am building a free WhatsApp + Shopify automation bot for my store (gulshanefashion.myshopify.com). 
+I have all the code files ready and I need you to help me upload them to GitHub so I can deploy on Render.com.
+
+Here is what the project does:
+- When a customer places a COD order on my Shopify store, the bot automatically sends them a WhatsApp message with an order confirmation poll (3 options: COD / Advance Payment / Cancel)
+- When the customer votes, it sends an auto-reply and tags the Shopify order
+- It also sends abandoned cart recovery messages after 30 minutes
+
+The tech stack is: Node.js + Express + Baileys (WhatsApp Web library) + Shopify Webhooks
+
+I have attached all 7 code files:
+1. server.js — main Express server with all webhook handlers + /qr page + /setup-webhooks route
+2. whatsapp.js — Baileys WhatsApp connection and message sending
+3. messageTemplates.js — all message text (Urdu/English mix)
+4. orderManager.js — handles poll votes and tags Shopify orders
+5. setup-webhooks.js — registers Shopify webhooks (one-time script)
+6. package.json — all npm dependencies
+7. .env.example — environment variables template
+
+WHAT I NEED YOU TO DO:
+Step 1 — Help me create a new GitHub repository called "whatsapp-shopify-bot"
+Step 2 — Upload all 7 attached files to that repository
+Step 3 — Confirm all files are uploaded correctly
+
+After GitHub is done, I will deploy to Render.com by:
+- Connecting Render to this GitHub repo
+- Setting environment variables in Render
+- Then visiting /qr on my Render URL to scan WhatsApp QR code
+- Then visiting /setup-webhooks on my Render URL to register Shopify webhooks
+
+Please start with Step 1 — creating the GitHub repository.
