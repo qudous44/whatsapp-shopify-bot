@@ -288,13 +288,12 @@ function toJid(phone) {
 async function sendOrderConfirmation(phone, order) {
   const jid = toJid(phone);
 
-  // Send text message
-  await safeSend(jid, { text: formatMessage('orderConfirmation', order) });
-
-  // Send poll
+  // ── Single message: order details text embedded as poll question (WhatFlow style) ──
+  // The poll 'name' IS the full confirmation message — text + poll in ONE bubble
+  const confirmText = formatMessage('orderConfirmation', order);
   const pollResult = await safeSend(jid, {
     poll: {
-      name: 'Please confirm your order:',
+      name: confirmText,
       values: POLL_OPTIONS,
       selectableCount: 1
     }
@@ -316,7 +315,7 @@ async function sendOrderConfirmation(phone, order) {
     console.log(`[POLL] Stored poll ${pollMsgId} for ${jid} (memory + disk)`);
   }
 
-  console.log(`[SEND] Confirmation + poll sent to ${phone}`);
+  console.log(`[SEND] Confirmation + poll sent to ${phone} (single combined message)`);
 }
 
 // ══════════════════════════════════════════════════════════
