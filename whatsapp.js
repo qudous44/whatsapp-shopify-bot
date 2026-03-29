@@ -18,6 +18,8 @@ let sock = null, qrImg = null, status = 'disconnected';
 let qrShownOnce = false;
 let authState = null;
 
+// In-memory map: pollMsgId -> { jid, msg (full WAMessage) }
+// Used for same-instance vote decryption (PATH 1)
 const sentPolls = new Map();
 const messageQueue = [];
 const processedPollVotes = new Set();
@@ -47,11 +49,11 @@ function clearSignalKeys() {
 function waitForConnection(maxWaitMs = 120000) {
   return new Promise((resolve, reject) => {
     if (status === 'connected') return resolve();
-    console.log(`[WAIT] WhatsApp not connected, waiting up to ${maxWaitMs / 1000}s...`);
+    console.log(`[WAIT] Waiting up to ${maxWaitMs / 1000}s for WA...`);
     const start = Date.now();
     const interval = setInterval(() => {
       if (status === 'connected') { clearInterval(interval); resolve(); }
-      else if (Date.now() - start > maxWaitMs) { clearInterval(interval); reject(new Error('WhatsApp connection timeout')); }
+      else if (Date.now() - start > maxWaitMs) { clearInterval(interval); reject(new Error('WA timeout')); }
     }, 3000);
   });
 }
@@ -64,52 +66,95 @@ async function safeSend(jid, content) {
 async function processQueue() {
   while (messageQueue.length > 0) {
     const { fn, args } = messageQueue.shift();
-    try { await fn(...args); } catch (e) { console.error('[QUEUE] Error:', e.message); }
+    try { await fn(...args); } catch (e) { console.error('[QUEUE]', e.message); }
   }
 }
 
+// ══════════════════════════════════════════════════════════
+// CORE POLL VOTE PROCESSOR
+// PATH 1: same-instance — use in-memory sentPolls + getAggregateVotesInPollMessage
+// PATH 1b: after-redeploy — use Redis-stored WAMessage + getAggregateVotesInPollMessage
+// PATH 2: fallback — SHA-256 hash matching (only works if vote.selectedOptions is populated)
+// ══════════════════════════════════════════════════════════
 async function processPollVote(pollMsgId, pollUpdates, source) {
   if (processedPollVotes.has(pollMsgId)) {
-    console.log(`[POLL] Already processed ${pollMsgId}, skipping`);
+    console.log(`[POLL] Duplicate vote ignored for ${pollMsgId}`);
     return;
   }
-  console.log(`[POLL] Processing vote for pollMsgId: ${pollMsgId} via ${source}`);
+  console.log(`[POLL] Processing vote for ${pollMsgId} via ${source}`);
+  console.log(`[POLL] pollUpdates: ${JSON.stringify(pollUpdates, (k,v) => Buffer.isBuffer(v) ? '[Buffer]' : v)}`);
 
   let votedOption = null;
   let voterJid = null;
 
-  // PATH 1: in-memory (same instance)
-  const pollData = sentPolls.get(pollMsgId);
-  if (pollData && pollData.msg && authState) {
+  // ── PATH 1: Same instance, full WAMessage in memory ──
+  const memData = sentPolls.get(pollMsgId);
+  if (memData && memData.msg && authState) {
     console.log('[POLL] PATH 1: in-memory decryption');
     try {
       const votes = getAggregateVotesInPollMessage({
-        message: pollData.msg.message,
-        key: pollData.msg.key,
+        message: memData.msg.message,
+        key: memData.msg.key,
         pollUpdates
       }, authState.creds.me);
       console.log(`[POLL] PATH 1 votes: ${JSON.stringify(votes?.map(v => ({ name: v.name, count: v.voters?.length })))}`);
-      if (votes && votes.length > 0) {
-        for (const v of votes) {
-          if (v.voters && v.voters.length > 0) { votedOption = v.name; break; }
-        }
+      for (const v of (votes || [])) {
+        if (v.voters && v.voters.length > 0) { votedOption = v.name; break; }
       }
-      voterJid = pollData.jid;
-      if (votedOption) console.log(`[POLL] PATH 1 SUCCESS: "${votedOption}" from ${voterJid}`);
+      voterJid = memData.jid;
+      if (votedOption) console.log(`[POLL] PATH 1 SUCCESS: "${votedOption}"`);
     } catch (e) {
       console.error('[POLL] PATH 1 error:', e.message);
     }
   }
 
-  // PATH 2: disk hash matching (after redeploy)
-  if (!votedOption) {
+  // ── PATH 1b: After redeploy — load WAMessage from Redis ──
+  if (!votedOption && authState) {
     const diskData = await getPollOptions(pollMsgId);
-    if (diskData) {
-      console.log('[POLL] PATH 2: disk hash matching');
+    if (diskData && diskData.msg) {
+      console.log('[POLL] PATH 1b: Redis WAMessage decryption');
+      voterJid = diskData.jid;
+      try {
+        const votes = getAggregateVotesInPollMessage({
+          message: diskData.msg.message,
+          key: diskData.msg.key,
+          pollUpdates
+        }, authState.creds.me);
+        console.log(`[POLL] PATH 1b votes: ${JSON.stringify(votes?.map(v => ({ name: v.name, count: v.voters?.length })))}`);
+        for (const v of (votes || [])) {
+          if (v.voters && v.voters.length > 0) { votedOption = v.name; break; }
+        }
+        if (votedOption) console.log(`[POLL] PATH 1b SUCCESS: "${votedOption}"`);
+      } catch (e) {
+        console.error('[POLL] PATH 1b error:', e.message);
+      }
+
+      // ── PATH 2: SHA-256 hash fallback ──
+      if (!votedOption) {
+        console.log('[POLL] PATH 2: SHA-256 hash fallback');
+        for (const pu of pollUpdates) {
+          const hashes = pu.vote?.selectedOptions || pu.selectedOptions || [];
+          console.log(`[POLL] PATH 2: ${hashes.length} hash(es)`);
+          for (const hash of hashes) {
+            for (const optionName of diskData.options) {
+              const expected = crypto.createHash('sha256').update(optionName).digest();
+              const buf = Buffer.isBuffer(hash) ? hash : Buffer.from(hash);
+              if (buf.equals(expected)) { votedOption = optionName; break; }
+            }
+            if (votedOption) break;
+          }
+          if (votedOption) break;
+        }
+        if (votedOption) console.log(`[POLL] PATH 2 SUCCESS: "${votedOption}"`);
+      }
+    } else if (!diskData) {
+      console.log(`[POLL] No Redis data for ${pollMsgId}`);
+    } else {
+      console.log('[POLL] Redis data found but no WAMessage stored — PATH 2 only');
+      // PATH 2 only (old polls from before this fix)
       voterJid = diskData.jid;
       for (const pu of pollUpdates) {
         const hashes = pu.vote?.selectedOptions || pu.selectedOptions || [];
-        console.log(`[POLL] PATH 2: ${hashes.length} hash(es) to check`);
         for (const hash of hashes) {
           for (const optionName of diskData.options) {
             const expected = crypto.createHash('sha256').update(optionName).digest();
@@ -120,23 +165,6 @@ async function processPollVote(pollMsgId, pollUpdates, source) {
         }
         if (votedOption) break;
       }
-      if (votedOption) {
-        console.log(`[POLL] PATH 2 SUCCESS: "${votedOption}" from ${voterJid}`);
-      } else {
-        console.log('[POLL] PATH 2: No hash match — full debug:');
-        for (const pu of pollUpdates) {
-          const hashes = pu.vote?.selectedOptions || pu.selectedOptions || [];
-          console.log(`[POLL-DBG] update keys: ${Object.keys(pu).join(', ')}`);
-          for (const h of hashes) {
-            console.log(`[POLL-DBG] received: ${Buffer.isBuffer(h) ? h.toString('hex') : Buffer.from(h).toString('hex')}`);
-          }
-        }
-        for (const optName of (diskData.options || [])) {
-          console.log(`[POLL-DBG] expected "${optName}": ${crypto.createHash('sha256').update(optName).digest('hex')}`);
-        }
-      }
-    } else {
-      console.log(`[POLL] PATH 2: No disk data for ${pollMsgId}`);
     }
   }
 
@@ -146,7 +174,7 @@ async function processPollVote(pollMsgId, pollUpdates, source) {
     await handlePollVote(voterJid, votedOption, sock);
     sentPolls.delete(pollMsgId);
   } else {
-    console.log(`[POLL] FAILED to resolve vote — no option matched`);
+    console.log('[POLL] FAILED — could not resolve vote option');
   }
 }
 
@@ -182,7 +210,7 @@ async function getWASocket() {
       status = 'connected';
       qrImg = null;
       qrShownOnce = false;
-      console.log('[WA] WhatsApp Connected!');
+      console.log('[WA] Connected!');
       processQueue();
     }
     if (connection === 'close') {
@@ -193,60 +221,38 @@ async function getWASocket() {
         console.log('[WA] Reconnecting in 5s...');
         setTimeout(getWASocket, 5000);
       } else {
-        console.log('[WA] Logged out. Need fresh QR scan.');
+        console.log('[WA] Logged out.');
         qrShownOnce = false;
       }
     }
   });
 
-  // ── messages.update: primary poll vote handler ──
+  // ── messages.update: Baileys delivers poll votes here ──
   sock.ev.on('messages.update', async (updates) => {
     for (const { key, update } of updates) {
-      // RAW DEBUG LOG — shows exactly what Baileys sends for every update
-      const updateStr = JSON.stringify(update, (k, v) => Buffer.isBuffer(v) ? '[Buffer:' + v.toString('hex').slice(0,16) + ']' : v);
-      console.log(`[RAW-UPDATE] key=${key?.id?.slice(0,12)} update=${updateStr.slice(0,300)}`);
-
-      // Standard pollUpdates field
       if (update?.pollUpdates && update.pollUpdates.length > 0) {
-        console.log('[EVENT] messages.update: pollUpdates found');
+        console.log(`[EVENT] messages.update: pollUpdates for ${key.id}`);
         await processPollVote(key.id, update.pollUpdates, 'messages.update');
-        continue;
-      }
-
-      // Nested pollUpdateMessage inside update.message
-      if (update?.message?.pollUpdateMessage) {
-        console.log('[EVENT] messages.update: nested pollUpdateMessage');
-        const pum = update.message.pollUpdateMessage;
-        const origId = pum.pollCreationMessageKey?.id;
-        if (origId) {
-          await processPollVote(origId, [{ vote: pum.vote, pollUpdateMessageKey: key }], 'messages.update-nested');
-        }
-        continue;
       }
     }
   });
 
-  // ── messages.upsert: secondary poll vote handler ──
+  // ── messages.upsert: some Baileys versions send poll votes here ──
   sock.ev.on('messages.upsert', async ({ messages: msgs, type }) => {
     for (const msg of msgs) {
-      // RAW DEBUG for any upsert
-      if (msg.message) {
-        const msgKeys = Object.keys(msg.message);
-        console.log(`[RAW-UPSERT] type=${type} from=${msg.key?.remoteJid?.slice(0,20)} msgKeys=${msgKeys.join(',')}`);
-      }
-
       if (msg.message?.pollUpdateMessage) {
         const pum = msg.message.pollUpdateMessage;
-        console.log(`[EVENT] messages.upsert: pollUpdateMessage`);
+        console.log(`[EVENT] messages.upsert: pollUpdateMessage from ${msg.key?.remoteJid}`);
         const origId = pum.pollCreationMessageKey?.id;
         if (origId) {
-          await processPollVote(origId, [{ vote: pum.vote, pollUpdateMessageKey: msg.key }], 'messages.upsert');
+          // Build pollUpdates array for getAggregateVotesInPollMessage
+          const pollUpdates = [{
+            pollUpdateMessageKey: msg.key,
+            vote: pum.vote,
+            senderTimestampMs: pum.senderTimestampMs
+          }];
+          await processPollVote(origId, pollUpdates, 'messages.upsert');
         }
-        continue;
-      }
-
-      if (msg.message?.pollCreationMessage || msg.message?.pollCreationMessageV3) {
-        console.log('[EVENT] messages.upsert: outgoing poll creation');
       }
     }
   });
@@ -269,9 +275,11 @@ async function sendOrderConfirmation(phone, order) {
   });
   if (pollResult && pollResult.key) {
     const pollMsgId = pollResult.key.id;
+    // Store in memory (PATH 1 — same instance)
     sentPolls.set(pollMsgId, { jid, msg: pollResult });
-    storePollOptions(pollMsgId, jid, POLL_OPTIONS);
-    console.log(`[POLL] Stored poll ${pollMsgId} for ${jid} (memory + disk)`);
+    // Store in Redis WITH full WAMessage (PATH 1b — after redeploy)
+    await storePollOptions(pollMsgId, jid, POLL_OPTIONS, pollResult);
+    console.log(`[POLL] Stored poll ${pollMsgId} (memory + Redis with WAMessage)`);
   }
   console.log(`[SEND] Confirmation + poll sent to ${phone}`);
 }
