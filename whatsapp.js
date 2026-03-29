@@ -14,7 +14,7 @@ const path = require('path');
 const { formatMessage } = require('./messageTemplates');
 const { storePollOptions, getPollOptions, handlePollVote } = require('./orderManager');
 
-let sock = null, qrImg = null, status = 'disconnected';
+let sock = null, qrImg = null, status = 'disconnected';h
 let qrShownOnce = false;   // for clearSignalKeys — only clear once per login cycle
 let authState = null;       // store auth state for poll decryption
 
@@ -153,7 +153,7 @@ async function processPollVoteFromUpdate(key, pollUpdates, source) {
 
   // ── PATH 2: Fallback to SHA-256 hash matching from disk ──
   if (!votedOption) {
-        const diskData = getPollOptions(pollMsgId);
+        const diskData = await getPollOptions(pollMsgId);
         if (diskData) {
                 console.log('[POLL] PATH 2: Using disk-persisted poll options for hash matching');
                 voterJid = diskData.jid;
