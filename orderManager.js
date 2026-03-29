@@ -2,103 +2,130 @@ const axios = require('axios');
 const crypto = require('crypto');
 const { Redis } = require('@upstash/redis');
 
-// ── Upstash Redis client (persists across Render restarts/redeploys) ──
 const redis = new Redis({
-    url: process.env.UPSTASH_REDIS_REST_URL,
-    token: process.env.UPSTASH_REDIS_REST_TOKEN,
+  url: process.env.UPSTASH_REDIS_REST_URL,
+  token: process.env.UPSTASH_REDIS_REST_TOKEN,
 });
 
 const PENDING_PREFIX = 'pending:';
 const POLL_PREFIX = 'poll:';
-const TTL = 24 * 60 * 60; // 24 hours in seconds
+const TTL = 24 * 60 * 60; // 24 hours
 
-// ── Phone number → WhatsApp JID ──
 function toJid(phone) {
-    let n = String(phone).replace(/\D/g, '');
-    if (n.startsWith('03') && n.length === 11) n = '92' + n.slice(1);
-    if (n.startsWith('3') && n.length === 10) n = '92' + n;
-    return n + '@s.whatsapp.net';
+  let n = String(phone).replace(/\D/g, '');
+  if (n.startsWith('03') && n.length === 11) n = '92' + n.slice(1);
+  if (n.startsWith('3') && n.length === 10) n = '92' + n;
+  return n + '@s.whatsapp.net';
 }
 
-// ── Register pending order (called after sending confirmation) ──
 async function registerPendingOrder(phone, order) {
-    const jid = toJid(phone);
-    await redis.set(
-          PENDING_PREFIX + jid,
-      { orderId: order.id, orderNumber: order.order_number, timestamp: Date.now() },
-      { ex: TTL }
-        );
-    console.log(`[PENDING] Registered order #${order.order_number} for ${jid}`);
+  const jid = toJid(phone);
+  await redis.set(
+    PENDING_PREFIX + jid,
+    { orderId: order.id, orderNumber: order.order_number, timestamp: Date.now() },
+    { ex: TTL }
+  );
+  console.log(`[PENDING] Registered order #${order.order_number} for ${jid}`);
 }
 
-// ── Store poll options to Redis (called after sending poll) ──
-async function storePollOptions(pollMsgId, jid, options) {
-    await redis.set(
-          POLL_PREFIX + pollMsgId,
-      { jid, options, timestamp: Date.now() },
-      { ex: TTL }
-        );
-    console.log(`[POLL-STORE] Stored poll ${pollMsgId} for ${jid} with ${options.length} options`);
-}
-
-// ── Get poll options from Redis (used by PATH 2 fallback) ──
-async function getPollOptions(pollMsgId) {
-    return await redis.get(POLL_PREFIX + pollMsgId);
-}
-
-// ── Handle poll vote ──
-async function handlePollVote(jid, votedOption, sock) {
-    const opt = votedOption.toLowerCase();
-    console.log(`[VOTE] Processing vote from ${jid}: "${votedOption}"`);
-
-  // Find pending order for this JID
-  const p = await redis.get(PENDING_PREFIX + jid);
-    if (!p) {
-          console.log(`[VOTE] No pending order found for ${jid} — may have expired or already processed`);
+// ── Store poll options + full WAMessage to Redis ──
+// Stores both the option names AND the serialized poll WAMessage
+// so getAggregateVotesInPollMessage can decrypt votes after redeploy
+async function storePollOptions(pollMsgId, jid, options, pollWAMessage) {
+  // Serialize WAMessage to JSON, converting Buffers to base64
+  let msgJson = null;
+  if (pollWAMessage) {
+    try {
+      msgJson = JSON.stringify(pollWAMessage, (k, v) => {
+        if (v && typeof v === 'object' && v.type === 'Buffer' && Array.isArray(v.data)) {
+          return { __type: 'Buffer', data: Buffer.from(v.data).toString('base64') };
+        }
+        if (Buffer.isBuffer(v)) {
+          return { __type: 'Buffer', data: v.toString('base64') };
+        }
+        return v;
+      });
+    } catch (e) {
+      console.error('[POLL-STORE] Failed to serialize WAMessage:', e.message);
     }
+  }
+  await redis.set(
+    POLL_PREFIX + pollMsgId,
+    { jid, options, timestamp: Date.now(), msgJson },
+    { ex: TTL }
+  );
+  console.log(`[POLL-STORE] Stored poll ${pollMsgId} for ${jid} with ${options.length} options (msg: ${msgJson ? 'yes' : 'no'})`);
+}
+
+// ── Get poll data from Redis ──
+async function getPollOptions(pollMsgId) {
+  const data = await redis.get(POLL_PREFIX + pollMsgId);
+  if (!data) return null;
+  // Deserialize WAMessage Buffers from base64
+  if (data.msgJson) {
+    try {
+      data.msg = JSON.parse(data.msgJson, (k, v) => {
+        if (v && typeof v === 'object' && v.__type === 'Buffer') {
+          return Buffer.from(v.data, 'base64');
+        }
+        return v;
+      });
+    } catch (e) {
+      console.error('[POLL-GET] Failed to deserialize WAMessage:', e.message);
+    }
+  }
+  return data;
+}
+
+async function handlePollVote(jid, votedOption, sock) {
+  const opt = votedOption.toLowerCase();
+  console.log(`[VOTE] Processing vote from ${jid}: "${votedOption}"`);
+
+  const p = await redis.get(PENDING_PREFIX + jid);
+  if (!p) {
+    console.log(`[VOTE] No pending order found for ${jid}`);
+  }
 
   let msg = '', tag = '';
 
   if (opt.includes('cash') || (opt.includes('confirm') && !opt.includes('advance'))) {
-        msg = '✅ *Order Confirmed! (Cash on Delivery)*\n\nShukriya! Aapka order confirm ho gaya hai. 🎉\nDelivery pe courier ko payment karein.\n\n*Gulshan-e-Fashion* 🛍️';
-        tag = '✅ Order Confirmed';
+    msg = '✅ *Order Confirmed! (Cash on Delivery)*\n\nShukriya! Aapka order confirm ho gaya hai. 🎉\nDelivery pe courier ko payment karein.\n\n*Gulshan-e-Fashion* 🛍️';
+    tag = '✅ Order Confirmed';
   } else if (opt.includes('advance') || opt.includes('150')) {
-        msg = '💳 *Advance Payment Selected!*\n\nTotal amount me se *Rs.150 kam* hamare account me bhej dein.\nScreenshot share karein — order process ho jayega. ✅\n\n*Bank Details:*\n\n🏦 Bank: UBL\n👤 Title: Gulshan e Fashion\n🔢 Account No: 2661350931229\n🆔 IBAN: PK13UNIL0109000350931229\n\n_Agar payment receive na hui to order COD full amount par dispatch hoga._';
-        tag = '✅ Paid Order (Verify Payment)';
+    msg = '💳 *Advance Payment Selected!*\n\nTotal amount me se *Rs.150 kam* hamare account me bhej dein.\nScreenshot share karein — order process ho jayega. ✅\n\n*Bank Details:*\n\n🏦 Bank: UBL\n👤 Title: Gulshan e Fashion\n🔢 Account No: 2661350931229\n🇮🏩 IBAN: PK13UNIL0109000350931229\n\n_Agar payment receive na hui to order COD full amount par dispatch hoga._';
+    tag = '✅ Paid Order (Verify Payment)';
   } else if (opt.includes('cancel')) {
-        msg = '❌ *Order Cancelled*\n\nAapka order cancel kar diya gaya hai.\n\nDobara order: gulshanefashion.com\n\n*Gulshan-e-Fashion* 😊';
-        tag = 'Cancelled';
+    msg = '❌ *Order Cancelled*\n\nAapka order cancel kar diya gaya hai.\n\nDobara order: gulshanefashion.com\n\n*Gulshan-e-Fashion* 😊';
+    tag = 'Cancelled';
   }
 
-  // Send reply message
   if (msg) {
-        try {
-                await sock.sendMessage(jid, { text: msg });
-                console.log(`[VOTE] Reply sent to ${jid}`);
-        } catch (e) {
-                console.error(`[VOTE] Failed to send reply to ${jid}:`, e.message);
-        }
+    try {
+      await sock.sendMessage(jid, { text: msg });
+      console.log(`[VOTE] Reply sent to ${jid}`);
+    } catch (e) {
+      console.error(`[VOTE] Failed to send reply:`, e.message);
+    }
   }
 
-  // Tag Shopify order
   if (p && tag) {
-        const headers = {
-                'X-Shopify-Access-Token': process.env.SHOPIFY_ACCESS_TOKEN,
-                'Content-Type': 'application/json'
-        };
-        const url = `https://${process.env.SHOPIFY_SHOP_DOMAIN}/admin/api/2024-01/orders/${p.orderId}.json`;
-        try {
-                const g = await axios.get(url, { headers });
-                const existing = g.data.order.tags || '';
-                const updated = existing
-                  ? [...new Set([...existing.split(', '), tag])].join(', ')
-                          : tag;
-                await axios.put(url, { order: { id: p.orderId, tags: updated } }, { headers });
-                console.log(`[TAG] Order ${p.orderId} (#${p.orderNumber}) tagged → "${tag}"`);
-        } catch (e) {
-                console.error(`[TAG] Failed to tag order ${p.orderId}:`, e.response?.data || e.message);
-        }
-        await redis.del(PENDING_PREFIX + jid);
+    const headers = {
+      'X-Shopify-Access-Token': process.env.SHOPIFY_ACCESS_TOKEN,
+      'Content-Type': 'application/json'
+    };
+    const url = `https://${process.env.SHOPIFY_SHOP_DOMAIN}/admin/api/2024-01/orders/${p.orderId}.json`;
+    try {
+      const g = await axios.get(url, { headers });
+      const existing = g.data.order.tags || '';
+      const updated = existing
+        ? [...new Set([...existing.split(', '), tag])].join(', ')
+        : tag;
+      await axios.put(url, { order: { id: p.orderId, tags: updated } }, { headers });
+      console.log(`[TAG] Order ${p.orderId} (#${p.orderNumber}) tagged → "${tag}"`);
+    } catch (e) {
+      console.error(`[TAG] Failed to tag order:`, e.response?.data || e.message);
+    }
+    await redis.del(PENDING_PREFIX + jid);
   }
 }
 
