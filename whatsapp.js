@@ -14,7 +14,7 @@ const path = require('path');
 const { formatMessage } = require('./messageTemplates');
 const { storePollOptions, getPollOptions, handlePollVote } = require('./orderManager');
 
-let sock = null, qrImg = null, status = 'disconnected';h
+let sock = null, qrImg = null, status = 'disconnected';
 let qrShownOnce = false;   // for clearSignalKeys — only clear once per login cycle
 let authState = null;       // store auth state for poll decryption
 
