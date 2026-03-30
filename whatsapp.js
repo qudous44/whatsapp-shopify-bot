@@ -109,7 +109,7 @@ async function processQueue() {
 // PATH 1b: after-redeploy — use Redis-stored WAMessage + getAggregateVotesInPollMessage
 // PATH 2: fallback — SHA-256 hash matching (only works if vote.selectedOptions is populated)
 // ══════════════════════════════════════════════════════════
-async function processPollVote(pollMsgId, pollUpdates, source) {
+async function processPollVote(pollMsgId, pollUpdates, source, eventVoterJid = null) {
     if (processedPollVotes.has(pollMsgId)) {
         console.log(`[POLL] Duplicate vote ignored for ${pollMsgId}`);
         return;
@@ -119,10 +119,12 @@ async function processPollVote(pollMsgId, pollUpdates, source) {
     console.log(`[POLL] pollUpdates: ${JSON.stringify(pollUpdates, (k,v) => Buffer.isBuffer(v) ? '[Buffer]' : v)}`);
 
     let votedOption = null;
-    let voterJid = null;
+    // FIX: seed voterJid from the event's remoteJid so it's available even if
+    // sentPolls and Redis both miss (e.g. cold-start with no persisted state).
+    let voterJid = eventVoterJid || null;
 
-    // FIX: meId must be a string, not the full creds.me object
-    const meId = authState?.creds?.me?.id;
+    // meId must be a string; sock.user.id is the canonical source after connection
+    const meId = sock?.user?.id || authState?.creds?.me?.id;
     if (!meId) {
         console.error('[POLL] No meId available — authState not ready');
         return;
@@ -132,15 +134,18 @@ async function processPollVote(pollMsgId, pollUpdates, source) {
     const memData = sentPolls.get(pollMsgId);
     if (memData && memData.msg) {
         console.log('[POLL] PATH 1: in-memory decryption');
-        // Debug: check if messageSecret exists
-        const hasSecret = !!memData.msg.message?.messageContextInfo?.messageSecret;
-        console.log(`[POLL] PATH 1: messageSecret present: ${hasSecret}`);
+        // Debug: check if poll encKey exists (the field getAggregateVotesInPollMessage actually uses)
+        const hasEncKey = !!(memData.msg.message?.pollCreationMessageV3?.encKey
+            || memData.msg.message?.pollCreationMessage?.encKey);
+        console.log(`[POLL] PATH 1: poll encKey present: ${hasEncKey}`);
+        // FIX: set voterJid BEFORE the try block so it's always available even if decryption throws
+        voterJid = memData.jid;
         try {
             const votes = getAggregateVotesInPollMessage({
                 message: memData.msg.message,
                 key: memData.msg.key,
                 pollUpdates
-            }, meId);  // FIX: pass string meId, not object
+            }, meId);
 
             console.log(`[POLL] PATH 1 votes: ${JSON.stringify(votes?.map(v => ({ name: v.name, count: v.voters?.length })))}`);
 
@@ -150,7 +155,6 @@ async function processPollVote(pollMsgId, pollUpdates, source) {
                     break;
                 }
             }
-            voterJid = memData.jid;
             if (votedOption) console.log(`[POLL] PATH 1 SUCCESS: "${votedOption}"`);
         } catch (e) {
             console.error('[POLL] PATH 1 error:', e.message);
@@ -163,8 +167,9 @@ async function processPollVote(pollMsgId, pollUpdates, source) {
 
         if (diskData && diskData.msg) {
             console.log('[POLL] PATH 1b: Redis WAMessage decryption');
-            const hasSecret = !!diskData.msg.message?.messageContextInfo?.messageSecret;
-            console.log(`[POLL] PATH 1b: messageSecret present: ${hasSecret}`);
+            const hasEncKey = !!(diskData.msg.message?.pollCreationMessageV3?.encKey
+                || diskData.msg.message?.pollCreationMessage?.encKey);
+            console.log(`[POLL] PATH 1b: poll encKey present: ${hasEncKey}`);
             voterJid = diskData.jid;
 
             try {
@@ -172,7 +177,7 @@ async function processPollVote(pollMsgId, pollUpdates, source) {
                     message: diskData.msg.message,
                     key: diskData.msg.key,
                     pollUpdates
-                }, meId);  // FIX: pass string meId, not object
+                }, meId);
 
                 console.log(`[POLL] PATH 1b votes: ${JSON.stringify(votes?.map(v => ({ name: v.name, count: v.voters?.length })))}`);
 
@@ -300,7 +305,10 @@ async function getWASocket() {
 
             if (msg.message?.pollUpdateMessage) {
                 const pum = msg.message.pollUpdateMessage;
-                console.log(`[EVENT] messages.upsert: pollUpdateMessage from ${msg.key?.remoteJid}`);
+                // FIX: pass msg.key.remoteJid as the voter JID (it's the customer's JID
+                // in 1:1 chats) so processPollVote has it even before looking up stored data
+                const voterJidFromEvent = msg.key?.remoteJid || null;
+                console.log(`[EVENT] messages.upsert: pollUpdateMessage from ${voterJidFromEvent}`);
                 const origId = pum.pollCreationMessageKey?.id;
                 if (origId) {
                     const pollUpdates = [{
@@ -308,7 +316,7 @@ async function getWASocket() {
                         vote: pum.vote,
                         senderTimestampMs: pum.senderTimestampMs
                     }];
-                    await processPollVote(origId, pollUpdates, 'messages.upsert');
+                    await processPollVote(origId, pollUpdates, 'messages.upsert', voterJidFromEvent);
                 }
             }
         }
@@ -319,7 +327,9 @@ async function getWASocket() {
         for (const { key, update } of updates) {
             if (update?.pollUpdates && update.pollUpdates.length > 0) {
                 console.log(`[EVENT] messages.update: pollUpdates for ${key.id}`);
-                await processPollVote(key.id, update.pollUpdates, 'messages.update');
+                // FIX: pass key.remoteJid as the voter JID — in 1:1 chats this is
+                // the customer's JID, identical to what sentPolls stores
+                await processPollVote(key.id, update.pollUpdates, 'messages.update', key.remoteJid);
             }
         }
     });
