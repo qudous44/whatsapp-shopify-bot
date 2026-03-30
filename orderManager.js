@@ -117,7 +117,7 @@ async function handlePollVote(jid, votedOption, sock) {
         msg = '✅ *Order Confirmed! (Cash on Delivery)*\n\nShukriya! Aapka order confirm ho gaya hai. 🎉\nDelivery pe courier ko payment karein.\n\n*Gulshan-e-Fashion* 🛍️';
         tag = '✅ Order Confirmed';
     } else if (opt.includes('advance') || opt.includes('150')) {
-        msg = '💳 *Advance Payment Selected!*\n\nTotal amount me se *Rs.150 kam* hamare account me bhej dein.\nScreenshot share karein — order process ho jayega. ✅\n\n*Bank Details:*\n\n🏦 Bank: UBL\n👤 Title: Gulshan e Fashion\n🔢 Account No: 2661350931229\n🇮🏩 IBAN: PK13UNIL0109000350931229\n\n_Agar payment receive na hui to order COD full amount par dispatch hoga._';
+        msg = '💳 *Advance Payment Selected!*\n\nTotal amount me se *Rs.150 kam* hamare account me bhej dein.\nScreenshot share karein — order process ho jayega. ✅\n\n*Bank Details:*\n\n🏦 Bank: UBL\n👤 Title: Gulshan e Fashion\n🔢 Account No: 2661350931229\n🇵🇰 IBAN: PK13UNIL0109000350931229\n\n_Agar payment receive na hui to order COD full amount par dispatch hoga._';
         tag = '✅ Paid Order (Verify Payment)';
     } else if (opt.includes('cancel')) {
         msg = '❌ *Order Cancelled*\n\nAapka order cancel kar diya gaya hai.\n\nDobara order: gulshanefashion.com\n\n*Gulshan-e-Fashion* 😊';
@@ -131,6 +131,8 @@ async function handlePollVote(jid, votedOption, sock) {
         } catch (e) {
             console.error(`[VOTE] Failed to send reply:`, e.message);
         }
+    } else {
+        console.warn(`[VOTE] No reply template matched for option: "${votedOption}" — check condition strings`);
     }
 
     if (p && tag) {
